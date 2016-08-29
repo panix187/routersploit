@@ -1,6 +1,10 @@
 import unittest
+import logging
 
 from routersploit.utils import NonStringIterable
+
+
+logging.getLogger().addHandler(logging.NullHandler())
 
 
 class RoutersploitTestCase(unittest.TestCase):
@@ -14,7 +18,7 @@ class RoutersploitTestCase(unittest.TestCase):
             decorator_name,
             decorator_list,
             msg="'{}' method should be decorated with 'module_required'".format(function.__name__)
-            )
+        )
 
     def assertIsSequence(self, arg):
         self.assertEqual(

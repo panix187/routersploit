@@ -4,36 +4,43 @@ from __future__ import absolute_import
 import threading
 import os
 import sys
+import re
+import collections
 import random
 import string
-import socket
 import importlib
-import termios
-import tty
 import select
 import socket
+import errno
 from functools import wraps
 from distutils.util import strtobool
 from abc import ABCMeta, abstractmethod
 
 import requests
 
+from .printer import printer_queue, thread_output_stream
 from .exceptions import RoutersploitException
 from . import modules as rsf_modules
 
 MODULES_DIR = rsf_modules.__path__[0]
+CREDS_DIR = os.path.join(MODULES_DIR, 'creds')
+EXPLOITS_DIR = os.path.join(MODULES_DIR, 'exploits')
+SCANNERS_DIR = os.path.join(MODULES_DIR, 'scanners')
 
 print_lock = threading.Lock()
 
 colors = {
-    'grey': 30,  'red': 31,
+    'grey': 30, 'red': 31,
     'green': 32, 'yellow': 33,
-    'blue': 34,  'magenta': 35,
-    'cyan': 36,  'white': 37,
+    'blue': 34, 'magenta': 35,
+    'cyan': 36, 'white': 37,
 }
 
 # Disable certificate verification warnings
 requests.packages.urllib3.disable_warnings(requests.packages.urllib3.exceptions.InsecureRequestWarning)
+
+Resource = collections.namedtuple("Resource", ["name", "template_path", "context"])
+PrintResource = collections.namedtuple("PrintResource", ['content', 'sep', 'end', 'file', 'thread'])
 
 
 def index_modules(modules_directory=MODULES_DIR):
@@ -138,10 +145,10 @@ def stop_after(space_number):
         @wraps(wrapped_function)
         def _wrapper(self, *args, **kwargs):
             try:
-                if len(args[1].split(' ', space_number)) == space_number + 1:
+                if args[1].count(' ') == space_number:
                     return []
             except Exception as err:
-                print(err)
+                print_info(err)
             return wrapped_function(self, *args, **kwargs)
         return _wrapper
     return _outer_wrapper
@@ -149,18 +156,19 @@ def stop_after(space_number):
 
 class DummyFile(object):
     """  Mocking file object. Optimalization for the "mute" decorator. """
-    def write(self, x): pass
+    def write(self, x):
+        pass
 
 
 def mute(fn):
     """ Suppress function from printing to sys.stdout """
     @wraps(fn)
     def wrapper(self, *args, **kwargs):
-        sys.stdout = DummyFile()
+        thread_output_stream.setdefault(threading.current_thread(), []).append(DummyFile())
         try:
             return fn(self, *args, **kwargs)
         finally:
-            sys.stdout = sys.__stdout__
+            thread_output_stream[threading.current_thread()].pop()
     return wrapper
 
 
@@ -219,17 +227,21 @@ def __cprint(*args, **kwargs):
     if not kwargs.pop("verbose", True):
         return
 
-    with print_lock:
-        color = kwargs.get('color', None)
-        if color:
-            file_ = kwargs.get('file', sys.stdout)
-            sep = kwargs.get('sep', ' ')
-            end = kwargs.get('end', '\n')
-            print('\033[{}m'.format(colors[color]), end='', file=file_, sep=sep)
-            print(*args, end='', file=file_, sep=sep)  # TODO printing text that starts from newline
-            print('\033[0m', sep=sep, end=end, file=file_)
-        else:
-            print(*args, **kwargs)
+    color = kwargs.get('color', None)
+    sep = kwargs.get('sep', ' ')
+    end = kwargs.get('end', '\n')
+    thread = threading.current_thread()
+    try:
+        file_ = thread_output_stream.get(thread, ())[-1]
+    except IndexError:
+        file_ = kwargs.get('file', sys.stdout)
+
+    if color:
+        printer_queue.put(PrintResource(content='\033[{}m'.format(colors[color]), end='', file=file_, sep=sep, thread=thread))
+        printer_queue.put(PrintResource(content=args, end='', file=file_, sep=sep, thread=thread))  # TODO printing text that starts from newline
+        printer_queue.put(PrintResource(content='\033[0m', sep=sep, end=end, file=file_, thread=thread))
+    else:
+        printer_queue.put(PrintResource(content=args, sep=sep, end=end, file=file_, thread=thread))
 
 
 def print_error(*args, **kwargs):
@@ -322,9 +334,9 @@ def print_table(headers, *args, **kwargs):
             '{:<{}}'.format(header_separator * len(header), current_line_fill)
         ))
 
-    print()
-    print(headers_line)
-    print(headers_separator_line)
+    print_info()
+    print_info(headers_line)
+    print_info(headers_separator_line)
     for arg in args:
         content_line = '   '
         for idx, element in enumerate(arg):
@@ -332,9 +344,9 @@ def print_table(headers, *args, **kwargs):
                 content_line,
                 '{:<{}}'.format(element, fill[idx])
             ))
-        print(content_line)
+        print_info(content_line)
 
-    print()
+    print_info()
 
 
 def sanitize_url(address):
@@ -391,9 +403,9 @@ def pprint_dict_in_order(dictionary, order=None):
         prettyprint(rest_keys, dictionary[rest_keys])
 
 
-def random_text(length, alph=string.ascii_letters+string.digits):
+def random_text(length, alph=string.ascii_letters + string.digits):
     """ Random text generator. NOT crypto safe.
-    
+
     Generates random text with specified length and alphabet.
     """
     return ''.join(random.choice(alph) for _ in range(length))
@@ -443,36 +455,172 @@ def boolify(value):
 
 def ssh_interactive(ssh):
     chan = ssh.invoke_shell()
+    if os.name == 'posix':
+        posix_shell(chan)
+    else:
+        windows_shell(chan)
+
+
+def posix_shell(chan):
+    import termios
+    import tty
+
     oldtty = termios.tcgetattr(sys.stdin)
     try:
         tty.setraw(sys.stdin.fileno())
         tty.setcbreak(sys.stdin.fileno())
         chan.settimeout(0.0)
 
-        while(True):
+        while True:
             r, w, e = select.select([chan, sys.stdin], [], [])
-            if(chan in r):
+            if chan in r:
                 try:
                     x = unicode(chan.recv(1024))
-
-                    if(len(x) == 0):
-                        sys.stdout.write('\r\nExiting...\r\n')
+                    if len(x) == 0:
                         break
-
                     sys.stdout.write(x)
                     sys.stdout.flush()
-    
                 except socket.timeout:
                     pass
 
-            if(sys.stdin in r):
+            if sys.stdin in r:
                 x = sys.stdin.read(1)
-
-                if(len(x) == 0):
-                   break
-
+                if len(x) == 0:
+                    break
                 chan.send(x)
-            
     finally:
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, oldtty)
-        return 
+        return
+
+
+def windows_shell(chan):
+    def writeall(sock):
+        while True:
+            data = sock.recv(256)
+            if not data:
+                sys.stdout.flush()
+                return
+
+            sys.stdout.write(data)
+            sys.stdout.flush()
+
+    writer = threading.Thread(target=writeall, args=(chan,))
+    writer.start()
+
+    try:
+        while True:
+            d = sys.stdin.read(1)
+            if not d:
+                break
+
+            chan.send(d)
+    except:
+        pass
+
+
+def tokenize(token_specification, text):
+    Token = collections.namedtuple('Token', ['typ', 'value', 'line', 'column', 'mo'])
+
+    token_specification.extend((
+        ('NEWLINE', r'\n'),          # Line endings
+        ('SKIP', r'.'),              # Any other character
+    ))
+
+    tok_regex = '|'.join('(?P<%s>%s)' % pair for pair in token_specification)
+    line_num = 1
+    line_start = 0
+    for mo in re.finditer(tok_regex, text):
+        kind = mo.lastgroup
+        value = filter(lambda x: x is not None, mo.groups())
+        if kind == 'NEWLINE':
+            line_start = mo.end()
+            line_num += 1
+        elif kind == 'SKIP':
+            pass
+        else:
+            column = mo.start() - line_start
+            yield Token(kind, value, line_num, column, mo)
+
+
+def create_exploit(path):  # TODO: cover with tests
+    from .templates import exploit
+
+    parts = path.split(os.sep)
+    module_type, name = parts[0], parts[-1]
+    if len(parts) < 3:
+        print_error("Invalid format. "
+                    "Use following naming convention: module_type/vendor_name/exploit_name\n"
+                    "e.g. exploits/dlink/password_disclosure".format(name))
+        return
+
+    if not name:
+        print_error("Invalid exploit name: '{}'\n"
+                    "Use following naming convention: module_type/vendor_name/exploit_name\n"
+                    "e.g. exploits/dlink/password_disclosure".format(name))
+        return
+
+    types = ['creds', 'exploits', 'scanners']
+    if module_type not in types:
+        print_error("Invalid module type: '{}'\n"
+                    "Available types: {}\n"
+                    "Use following naming convention: module_type/vendor_name/exploit_name\n"
+                    "e.g. exploits/dlink/password_disclosure".format(module_type, types))
+        return
+
+    create_resource(
+        name=os.path.join(*parts[:-1]),
+        content=(
+            Resource(
+                name="{}.py".format(name),
+                template_path=os.path.abspath(exploit.__file__.rstrip("c")),
+                context={}),
+        ),
+        python_package=True
+    )
+
+
+def create_resource(name, content=(), python_package=False):  # TODO: cover with tests
+    """ Creates resource directory in current working directory. """
+    root_path = os.path.join(MODULES_DIR, name)
+    mkdir_p(root_path)
+
+    if python_package:
+        open(os.path.join(root_path, "__init__.py"), "a").close()
+
+    for name, template_path, context in content:
+        if os.path.splitext(name)[-1] == "":  # Checking if resource has extension if not it's directory
+            mkdir_p(os.path.join(root_path, name))
+        else:
+            try:
+                with open(template_path, "rb") as template_file:
+                    template = string.Template(template_file.read())
+            except (IOError, TypeError):
+                template = string.Template("")
+
+            try:
+                file_handle = os.open(os.path.join(root_path, name), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except OSError as e:
+                if e.errno == errno.EEXIST:
+                    print_status("{} already exist.".format(name))
+                else:
+                    raise
+            else:
+                with os.fdopen(file_handle, 'w') as target_file:
+                    target_file.write(template.substitute(**context))
+                    print_success("{} successfully created.".format(name))
+
+
+def mkdir_p(path):  # TODO: cover with tests
+    """
+    Simulate mkdir -p shell command. Creates directory with all needed parents.
+    :param path: Directory path that may include non existing parent directories
+    :return:
+    """
+    try:
+        os.makedirs(path)
+        print_success("Directory {path} successfully created.".format(path=path))
+    except OSError as exc:
+        if exc.errno == errno.EEXIST and os.path.isdir(path):
+            print_success("Directory {path}".format(path=path))
+        else:
+            raise

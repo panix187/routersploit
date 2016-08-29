@@ -13,9 +13,10 @@ from routersploit.utils import (
     multi,
     index_modules,
     ssh_interactive,
+    tokenize,
 )
 
 from routersploit import exploits
 from routersploit import wordlists
 from routersploit import validators
-from routersploit.shell import shell 
+from routersploit.shell import shell

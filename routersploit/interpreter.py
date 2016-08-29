@@ -1,10 +1,13 @@
 from __future__ import print_function
 import os
 import sys
+import itertools
 import traceback
 import atexit
 
+from routersploit.printer import PrinterThread, printer_queue
 from routersploit.exceptions import RoutersploitException
+from routersploit.exploits import GLOBAL_OPTS
 from routersploit import utils
 
 if sys.platform == "darwin":
@@ -73,7 +76,8 @@ class BaseInterpreter(object):
     def start(self):
         """ Routersploit main entry point. Starting interpreter loop. """
 
-        print(self.banner)
+        utils.print_info(self.banner)
+        printer_queue.join()
         while True:
             try:
                 command, args = self.parse_line(raw_input(self.prompt))
@@ -84,11 +88,13 @@ class BaseInterpreter(object):
             except RoutersploitException as err:
                 utils.print_error(err)
             except EOFError:
-                print()
+                utils.print_info()
                 utils.print_status("routersploit stopped")
                 break
             except KeyboardInterrupt:
-                print()
+                utils.print_info()
+            finally:
+                printer_queue.join()
 
     def complete(self, text, state):
         """Return the next possible completion for 'text'.
@@ -159,16 +165,25 @@ class RoutersploitInterpreter(BaseInterpreter):
     run                                 Run the selected module with the given options
     back                                De-select the current module
     set <option name> <option value>    Set an option for the selected module
+    setg <option name> <option value>   Set an option for all of the modules
+    unsetg <option name>                Unset option that was set globally
     show [info|options|devices]         Print information, options, or target devices for a module
     check                               Check if a given target is vulnerable to a selected module's exploit"""
 
     def __init__(self):
         super(RoutersploitInterpreter, self).__init__()
+        PrinterThread().start()
 
         self.current_module = None
         self.raw_prompt_template = None
         self.module_prompt_template = None
         self.prompt_hostname = 'rsf'
+        self.show_sub_commands = ('info', 'options', 'devices', 'all', 'creds', 'exploits', 'scanners')
+
+        self.global_commands = sorted(['use ', 'exec ', 'help', 'exit', 'show '])
+        self.module_commands = ['run', 'back', 'set ', 'setg ', 'check']
+        self.module_commands.extend(self.global_commands)
+        self.module_commands.sort()
 
         self.modules = utils.index_modules()
         self.main_modules_dirs = [module for module in os.listdir(utils.MODULES_DIR) if not module.startswith("__")]
@@ -186,7 +201,7 @@ class RoutersploitInterpreter(BaseInterpreter):
 
  Dev Team : Marcin Bury (lucyoa) & Mariusz Kupidura (fwkz)
  Codename : Bad Blood
- Version  : 2.1.0
+ Version  : 2.2.1
 
  Total module count: {modules_count}
 """.format(modules_count=len(self.modules))
@@ -245,10 +260,12 @@ class RoutersploitInterpreter(BaseInterpreter):
 
         :return: list of most accurate command suggestions
         """
-        if self.current_module:
-            return ['run', 'back', 'set ', 'show ', 'check', 'exec', 'help', 'exit']
+        if self.current_module and GLOBAL_OPTS:
+            return sorted(itertools.chain(self.module_commands, ('unsetg ',)))
+        elif self.current_module:
+            return self.module_commands
         else:
-            return ['use ', 'exec', 'help', 'exit']
+            return self.global_commands
 
     def command_back(self, *args, **kwargs):
         self.current_module = None
@@ -275,7 +292,7 @@ class RoutersploitInterpreter(BaseInterpreter):
         try:
             self.current_module.run()
         except KeyboardInterrupt:
-            print()
+            utils.print_info()
             utils.print_error("Operation cancelled by user")
         except:
             utils.print_error(traceback.format_exc(sys.exc_info()))
@@ -288,6 +305,8 @@ class RoutersploitInterpreter(BaseInterpreter):
         key, _, value = args[0].partition(' ')
         if key in self.current_module.options:
             setattr(self.current_module, key, value)
+            if kwargs.get("glob", False):
+                GLOBAL_OPTS[key] = value
             utils.print_success({key: value})
         else:
             utils.print_error("You can't set option '{}'.\n"
@@ -299,6 +318,33 @@ class RoutersploitInterpreter(BaseInterpreter):
             return [' '.join((attr, "")) for attr in self.current_module.options if attr.startswith(text)]
         else:
             return self.current_module.options
+
+    @utils.module_required
+    def command_setg(self, *args, **kwargs):
+        kwargs['glob'] = True
+        self.command_set(*args, **kwargs)
+
+    @utils.stop_after(2)
+    def complete_setg(self, text, *args, **kwargs):
+        return self.complete_set(text, *args, **kwargs)
+
+    @utils.module_required
+    def command_unsetg(self, *args, **kwargs):
+        key, _, value = args[0].partition(' ')
+        try:
+            del GLOBAL_OPTS[key]
+        except KeyError:
+            utils.print_error("You can't unset global option '{}'.\n"
+                              "Available global options: {}".format(key, GLOBAL_OPTS.keys()))
+        else:
+            utils.print_success({key: value})
+
+    @utils.stop_after(2)
+    def complete_unsetg(self, text, *args, **kwargs):
+        if text:
+            return [' '.join((attr, "")) for attr in GLOBAL_OPTS.keys() if attr.startswith(text)]
+        else:
+            return GLOBAL_OPTS.keys()
 
     @utils.module_required
     def get_opts(self, *args):
@@ -317,53 +363,76 @@ class RoutersploitInterpreter(BaseInterpreter):
                 yield opt_key, opt_value, opt_description
 
     @utils.module_required
+    def _show_info(self, *args, **kwargs):
+        utils.pprint_dict_in_order(
+            self.module_metadata,
+            ("name", "description", "devices", "authors", "references"),
+        )
+        utils.print_info()
+
+    @utils.module_required
+    def _show_options(self, *args, **kwargs):
+        target_opts = {'port', 'target'}
+        module_opts = set(self.current_module.options) - target_opts
+        headers = ("Name", "Current settings", "Description")
+
+        utils.print_info('\nTarget options:')
+        utils.print_table(headers, *self.get_opts(*target_opts))
+
+        if module_opts:
+            utils.print_info('\nModule options:')
+            utils.print_table(headers, *self.get_opts(*module_opts))
+
+        utils.print_info()
+
+    @utils.module_required
+    def _show_devices(self, *args, **kwargs):  # TODO: cover with tests
+        try:
+            devices = self.current_module._Exploit__info__['devices']
+
+            utils.print_info("\nTarget devices:")
+            i = 0
+            for device in devices:
+                if isinstance(device, dict):
+                    utils.print_info("   {} - {}".format(i, device['name']))
+                else:
+                    utils.print_info("   {} - {}".format(i, device))
+                i += 1
+            utils.print_info()
+        except KeyError:
+            utils.print_info("\nTarget devices are not defined")
+
+    def __show_modules(self, root=''):
+        for module in [module for module in self.modules if module.startswith(root)]:
+            utils.print_info(module.replace('.', os.sep))
+
+    def _show_all(self, *args, **kwargs):
+        self.__show_modules()
+
+    def _show_scanners(self, *args, **kwargs):
+        self.__show_modules('scanners')
+
+    def _show_exploits(self, *args, **kwargs):
+        self.__show_modules('exploits')
+
+    def _show_creds(self, *args, **kwargs):
+        self.__show_modules('creds')
+
     def command_show(self, *args, **kwargs):
-        info, options, devices = 'info', 'options', 'devices'
         sub_command = args[0]
-        if sub_command == info:
-            utils.pprint_dict_in_order(
-                self.module_metadata,
-                ("name", "description", "devices", "authors", "references"),
-            )
-            utils.print_info()
-        elif sub_command == options:
-            target_opts = {'port', 'target'}
-            module_opts = set(self.current_module.options) - target_opts
-            headers = ("Name", "Current settings", "Description")
-
-            utils.print_info('\nTarget options:')
-            utils.print_table(headers, *self.get_opts(*target_opts))
-
-            if module_opts:
-                utils.print_info('\nModule options:')
-                utils.print_table(headers, *self.get_opts(*module_opts))
-
-            utils.print_info()
-        elif sub_command == devices:
-            if devices in self.current_module._Exploit__info__.keys():
-                devices = self.current_module._Exploit__info__['devices']
-
-                print("\nTarget devices:")
-                i = 0
-                for device in devices:
-                    if isinstance(device, dict): 
-                        print("   {} - {}".format(i, device['name']))
-                    else:
-                        print("   {} - {}".format(i, device))
-                    i += 1
-                print()
-            else:
-                print("\nTarget devices are not defined")
-        else:
-            print("Unknown command 'show {}'. You want to 'show {}' or 'show {}'?".format(sub_command, info, options))
+        try:
+            getattr(self, "_show_{}".format(sub_command))(*args, **kwargs)
+        except AttributeError:
+            utils.print_error("Unknown 'show' sub-command '{}'. "
+                              "What do you want to show?\n"
+                              "Possible choices are: {}".format(sub_command, self.show_sub_commands))
 
     @utils.stop_after(2)
     def complete_show(self, text, *args, **kwargs):
-        sub_commands = ['info', 'options', 'devices']
         if text:
-            return filter(lambda command: command.startswith(text), sub_commands)
+            return [command for command in self.show_sub_commands if command.startswith(text)]
         else:
-            return sub_commands
+            return self.show_sub_commands
 
     @utils.module_required
     def command_check(self, *args, **kwargs):
@@ -380,9 +449,9 @@ class RoutersploitInterpreter(BaseInterpreter):
                 utils.print_status("Target could not be verified")
 
     def command_help(self, *args, **kwargs):
-        print(self.global_help)
+        utils.print_info(self.global_help)
         if self.current_module:
-            print("\n", self.module_help)
+            utils.print_info("\n", self.module_help)
 
     def command_exec(self, *args, **kwargs):
         os.system(args[0])
